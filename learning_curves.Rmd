@@ -1,0 +1,180 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(tidyverse)
+library(scales)
+library(modelr)
+library(lubridate)
+library(broom)
+#library(hrbrthemes)
+options(repr.plot.width=4, repr.plot.height=4)
+```
+
+
+```{r message = FALSE}
+#variants which occur more often in YRI, measured by ratio
+#predict on ceu population
+#br_ceu <- Sys.glob('learning_curve_data/bottom_ratio/ceu_*')
+#br_yri <- Sys.glob('learning_curve_data/bottom_ratio/yri_*')
+bd_ceu <- Sys.glob('learning_curve_data/bottom_diff/ceu_*')
+bd_yri <- Sys.glob('learning_curve_data/bottom_diff/yri_*')
+#tr_ceu <- Sys.glob('learning_curve_data/top_ratio/ceu_*')
+#tr_yri <- Sys.glob('learning_curve_data/top_ratio/yri_*')
+td_ceu <- Sys.glob('learning_curve_data/top_diff/ceu_*')
+td_yri <- Sys.glob('learning_curve_data/top_diff/yri_*')
+#evaluated on which group
+groups <- c( 
+#  rep('ceu', length(br_ceu)), 
+#  rep('yri', length(br_yri)),
+  rep('ceu', length(bd_ceu)), 
+  rep('yri', length(bd_yri)),
+#  rep('ceu', length(tr_ceu)), 
+#  rep('yri', length(tr_yri)),
+  rep('ceu', length(td_ceu)), 
+  rep('yri', length(td_yri))
+  )
+variant_sets <- c(
+#  rep('bottom_ratio', length(br_ceu) + length(br_yri)),
+  rep('bottom_diff', length(bd_ceu) + length(bd_yri)),
+#  rep('top_ratio', length(tr_ceu) + length(tr_yri)),
+  rep('top_diff', length(td_ceu) + length(td_yri))
+  ) 
+all_files <- c(bd_ceu, bd_yri, td_ceu, td_yri)
+```
+
+Construct the new test set:
+for both groups:
+the 5k train controls which we didn't use for training_size <= 5000k
+95k randomly selected out of the non-train people (who are all controls)
+
+```{r}
+write_perf_df <- function(this_run_id) {
+  this_run_df <- run_id_df %>% filter(run_id == this_run_id)
+  all_dfs <- list()
+  i = 1
+  j = 1
+  for (this_file in all_files) {
+    fname_tokens <- strsplit(this_file, '_')
+    this_id <-
+      as.double((last(fname_tokens[[1]]) %>% strsplit('\\.'))[[1]][1])
+    
+    cur_group <- groups[j]
+    cur_vs <- variant_sets[j]
+    j = j + 1
+    
+    if (!(this_id %in% this_run_df$identifier)) {
+      next
+    }
+    df <- read_csv(this_file)
+    #didn't train on eval group, not enough test samples, prs sim failed 
+    if (df$snps[1] != cur_group | df$training_size[1] > 5000 |  df %>% filter(is.infinite(emp_prs)) %>% nrow() > 0) {
+      next
+    }
+    all_dfs[[i]] <- df %>% mutate(variant_set = cur_vs)
+    i = i + 1
+  }
+  learning_curve_df <- bind_rows(all_dfs)
+  learning_curve_df <- learning_curve_df %>%
+    left_join(run_id_df, by = 'identifier')
+  
+  #set seed so that we choose the same test set every time
+  set.seed(1)
+  big_df <- learning_curve_df %>%
+    filter(training_size == 5000)
+  #construct overall test set
+  test_cases <- big_df %>%
+    filter(true_outcome == 1, is_in_training_data == 0) %>%
+    select(group, true_outcome, variant_set, snps, run_id)
+  test_controls <- big_df %>%
+    filter(true_outcome == 0, is_in_training_data == 0) %>%
+    group_by(variant_set, snps, run_id) %>%
+    sample_n(95000) %>%
+    select(group, true_outcome, variant_set, snps, run_id)
+  test <- bind_rows(test_cases, test_controls)
+  #For each run
+  #1) do platt scaling to convert emp prs estimates -> probability estimates
+  #2) make predictions on the test set
+  
+  #Create the dataframe we want to add utility to
+  census <- learning_curve_df %>%
+    count(training_size, variant_set, snps, identifier) %>%
+    mutate(rn = row_number())
+  n_runs <- census %>% summarize(f = max(rn)) %>% pull(f)
+  run_rows <- list()
+  for (i in 1:n_runs) {
+    this_df <- census %>%
+      filter(rn == i) %>%
+      left_join(learning_curve_df,
+                by = c('snps', 'variant_set', 'training_size', 'identifier'))
+    
+    this_train_df <- this_df %>%
+      filter(is_in_training_data == 1) %>%
+      mutate(regression_weights = if_else(true_outcome == 1, 1, 19))
+
+    #platt scaling model
+    logit <-
+      glm(
+        true_outcome ~ emp_prs,
+        data = this_train_df,
+        family = "binomial",
+        weights = regression_weights
+      )
+    #make predictions on everyone
+    this_df$pred <- predict(logit, this_df, type = 'response')
+    #port the predictions over to the test dataframe
+    right_side <-
+      this_df %>% select(group, snps, variant_set, pred, run_id)
+    mean_utility <- test %>%
+      inner_join(right_side, by = c('group', 'variant_set', 'snps', 'run_id')) %>%
+      mutate(
+        cost = 5,
+        benefit = 100,
+        expected_utility = pred * benefit - cost,
+        decision = if_else(expected_utility > 0, 1, 0),
+        actual_utility = decision * (benefit * true_outcome - cost)
+      ) %>%
+      summarize(mean_utility = mean(actual_utility)) %>%
+      pull(mean_utility)
+    row <- data.frame(i, mean_utility)
+    names(row) <- c("rn", "mean_actual_utility")
+    run_rows[[i]] <- row
+  }
+  this_perf_df <- census %>%
+    inner_join(do.call('bind_rows', run_rows), by = 'rn') %>%
+    mutate(run_id = this_run_id)
+  write_fname <-
+    paste('perf_dfs/', as.character(this_run_id), '.csv', sep = '')
+  this_perf_df %>% select(-rn) %>% write_csv(write_fname)
+}
+```
+
+```{r message = FALSE}
+run_id_files <- Sys.glob('output/sim1/training/run_ids/*')
+run_id_rows = list()
+i = 1
+for (f in run_id_files){
+  run_id_rows[[i]] <- read_csv(f)
+  i = i + 1
+}
+run_id_df <- bind_rows(run_id_rows)
+run_id_df <- run_id_df %>% filter(run_id > 0) #TODO REMOVE
+run_ids <- run_id_df %>% distinct(run_id) %>% arrange(run_id) %>% pull(run_id)
+run_ids
+```
+
+
+```{r message = FALSE}
+for (this_run_id in run_ids) {
+  write_fname <-
+    paste('perf_dfs/', as.character(this_run_id), '.csv', sep = '')
+  if (file.exists(write_fname)) {
+    print('file exists')
+  } else{
+    write_perf_df(this_run_id)
+  }
+}
+```
+
+
